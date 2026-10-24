@@ -1,0 +1,8 @@
+pandas>=2.2
+pyarrow>=15
+PyQt6>=6.6
+openpyxl>=3.1
+pytdx>=1.72
+openai>=1.30
+pywin32>=306; sys_platform == "win32"
+pyautogui>=0.9.54; sys_platform == "win32"

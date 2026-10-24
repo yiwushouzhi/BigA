@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+stock_data/
+build/
+dist/
+.pytest_cache/
+*.log
+.DS_Store

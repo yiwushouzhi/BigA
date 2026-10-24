@@ -33,19 +33,42 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+FALLBACK_HOSTS: tuple[tuple[str, int], ...] = (
+    ("119.147.212.81", 7709),
+    ("119.147.212.85", 7709),
+    ("218.75.126.9", 7709),
+    ("115.238.56.198", 7709),
+    ("180.153.18.170", 7709),
+    ("180.153.18.171", 7709),
+    ("202.108.253.130", 7709),
+    ("202.108.253.131", 7709),
+    ("60.191.117.167", 7709),
+    ("114.80.63.12", 7709),
+)
+
+
+def _default_hosts() -> tuple[tuple[str, int], ...]:
+    """优先使用 pytdx 内置的最新服务器列表，它比写死的 IP 更不容易失效。"""
+    try:
+        from pytdx.config.hosts import hq_hosts
+    except Exception:
+        return FALLBACK_HOSTS
+    seen: set[tuple[str, int]] = set()
+    hosts: list[tuple[str, int]] = []
+    for item in hq_hosts:
+        try:
+            ip, port = str(item[1]).strip(), int(item[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not ip or (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        hosts.append((ip, port))
+    return tuple(hosts) or FALLBACK_HOSTS
+
+
 def _parse_hosts(raw: str | None) -> tuple[tuple[str, int], ...]:
-    defaults = (
-        ("119.147.212.81", 7709),
-        ("119.147.212.85", 7709),
-        ("218.75.126.9", 7709),
-        ("115.238.56.198", 7709),
-        ("180.153.18.170", 7709),
-        ("180.153.18.171", 7709),
-        ("202.108.253.130", 7709),
-        ("202.108.253.131", 7709),
-        ("60.191.117.167", 7709),
-        ("114.80.63.12", 7709),
-    )
+    defaults = _default_hosts()
     if not raw:
         return defaults
     hosts: list[tuple[str, int]] = []

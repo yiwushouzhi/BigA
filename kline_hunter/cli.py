@@ -94,6 +94,8 @@ def cmd_update(config: AppConfig, args: argparse.Namespace) -> int:
         print(f"\n更新失败: {exc}", file=sys.stderr)
         return 1
     print(f"\n更新完成: {report.updated} 只，跳过 {report.skipped} 只，失败 {len(report.failed)} 只")
+    for item in report.warnings:
+        print(f"  ! {item}")
     for item in report.failed[:10]:
         print(f"  - {item}")
     if len(report.failed) > 10:

@@ -556,9 +556,11 @@ class MainWindow(QMainWindow):
             f"失败 {len(report.failed)} 只，耗时 {report.elapsed_seconds:.1f}s"
         )
         self.status_label.setText(text)
-        if report.failed:
+        warnings = "\n".join(getattr(report, "warnings", [])[:3])
+        if report.failed or warnings:
             detail = "\n".join(report.failed[:8])
-            QMessageBox.warning(self, "更新完成但有失败", f"{text}\n\n{detail}")
+            body = "\n\n".join(part for part in (warnings, detail) if part)
+            QMessageBox.warning(self, "更新完成但有异常", f"{text}\n\n{body}")
         else:
             QMessageBox.information(self, "更新完成", text)
 

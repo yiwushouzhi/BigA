@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 import pandas as pd
 
 from .config import AppConfig
-from .models import StockInfo, is_st_name
+from .models import StockInfo, is_st_name, market_for_code
 from .storage import StockStorage, StorageError
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -33,8 +33,20 @@ class UpdateReport:
     updated: int = 0
     skipped: int = 0
     failed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     stock_count: int = 0
+
+
+def _describe_error(exc: BaseException | None) -> str:
+    """pytdx 会把手底下的真实异常包成 calling function error，这里展开原始原因。"""
+    if exc is None:
+        return "未知错误"
+    text = f"{type(exc).__name__}: {exc}"
+    original = getattr(exc, "original_exception", None)
+    if original is not None:
+        text += f"（原始错误 {type(original).__name__}: {original}）"
+    return text
 
 
 def _is_a_share(code: str, market: int) -> bool:
@@ -57,12 +69,15 @@ def _decode(value: Any) -> str:
 class TdxCollector:
     """pytdx 采集器：全市场列表、日线、指数和增量更新。"""
 
+    MAX_CONNECT_ATTEMPTS = 10
+
     def __init__(self, config: AppConfig, storage: StockStorage, api_factory: Callable[[], Any] | None = None):
         self.config = config
         self.storage = storage
         self._api_factory = api_factory
         self._api: Any | None = None
         self._host: tuple[str, int] | None = None
+        self._host_pos = 0
 
     # ------------------------------------------------------------- connection
     def _new_api(self) -> Any:
@@ -77,8 +92,14 @@ class TdxCollector:
     def connect(self) -> Any:
         if self._api is not None:
             return self._api
+        hosts = list(self.config.tdx_hosts)
+        if not hosts:
+            raise CollectorError("没有配置任何行情服务器")
         last_error: Exception | None = None
-        for host, port in self.config.tdx_hosts:
+        attempts = min(len(hosts), self.MAX_CONNECT_ATTEMPTS)
+        for offset in range(attempts):
+            pos = (self._host_pos + offset) % len(hosts)
+            host, port = hosts[pos]
             api = self._new_api()
             try:
                 ok = api.connect(host, port, time_out=5.0)
@@ -86,6 +107,7 @@ class TdxCollector:
                     raise CollectorError(f"连接 {host}:{port} 返回 False")
                 self._api = api
                 self._host = (host, port)
+                self._host_pos = pos
                 return api
             except Exception as exc:
                 last_error = exc
@@ -93,7 +115,9 @@ class TdxCollector:
                     api.disconnect()
                 except Exception:
                     pass
-        raise CollectorError(f"无法连接任何通达信行情服务器: {last_error}")
+        raise CollectorError(
+            f"无法连接通达信行情服务器（已尝试 {attempts} 个）：{_describe_error(last_error)}"
+        )
 
     def disconnect(self) -> None:
         if self._api is not None:
@@ -104,21 +128,33 @@ class TdxCollector:
         self._api = None
         self._host = None
 
+    def _advance_host(self) -> None:
+        """当前服务器能连上但接口报错时，换下一台再试。"""
+        if self.config.tdx_hosts:
+            self._host_pos = (self._host_pos + 1) % len(self.config.tdx_hosts)
+
     def _reconnect(self) -> Any:
+        self._advance_host()
         self.disconnect()
         return self.connect()
 
-    def _call(self, method: str, *args: Any) -> Any:
-        api = self.connect()
-        try:
-            return getattr(api, method)(*args)
-        except Exception as exc:
-            # 行情服务器偶尔断线，换一个服务器重试一次。
+    def _call(self, method: str, *args: Any, attempts: int = 2) -> Any:
+        """调用行情接口；失败时自动切换服务器重试。"""
+        last_error: Exception | None = None
+        used_host: tuple[str, int] | None = None
+        for _ in range(max(1, attempts)):
+            api = self.connect()
+            used_host = self._host
             try:
-                api = self._reconnect()
                 return getattr(api, method)(*args)
-            except Exception as retry_exc:
-                raise CollectorError(f"行情接口 {method} 调用失败: {retry_exc}") from retry_exc
+            except Exception as exc:
+                last_error = exc
+                self._advance_host()
+                self.disconnect()
+        host_text = f"{used_host[0]}:{used_host[1]}" if used_host else "未知服务器"
+        raise CollectorError(
+            f"行情接口 {method} 调用失败（{host_text}，已换服务器重试）：{_describe_error(last_error)}"
+        )
 
     def __enter__(self) -> "TdxCollector":
         self.connect()
@@ -138,12 +174,30 @@ class TdxCollector:
         for market in (0, 1):
             count = self._call("get_security_count", market)
             if not count:
-                raise CollectorError(f"无法获取市场 {market} 的股票数量")
+                raise CollectorError(f"无法获取市场 {market} 的股票数量（服务器返回 {count}）")
             chunk = 1000
-            for start in range(0, int(count), chunk):
+            pages = min((int(count) + chunk - 1) // chunk, 100)
+            market_stocks = 0
+            consecutive_failures = 0
+            for page in range(pages):
                 if cancelled and cancelled():
                     raise CollectorError("更新已取消")
-                items = self._call("get_security_list", market, start) or []
+                try:
+                    items = self._call("get_security_list", market, page * chunk) or []
+                except CollectorError as exc:
+                    # 个别分页失败（服务器缺数据/解析异常）不应让整个列表更新失败。
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        raise CollectorError(
+                            f"市场 {market} 的股票列表连续 {consecutive_failures} 页读取失败，"
+                            f"该服务器可能不支持此接口。请在设置里更换行情服务器，"
+                            f"或用“指定代码”方式更新。{exc}"
+                        ) from exc
+                    continue
+                consecutive_failures = 0
+                if not items:
+                    break
+                market_stocks += len(items)
                 for item in items:
                     code = _decode(item.get("code")).strip()
                     name = _decode(item.get("name")).strip()
@@ -159,7 +213,9 @@ class TdxCollector:
                         )
                     )
                 if progress:
-                    progress(len(stocks), 0, f"读取股票列表 {market}/{start + chunk}")
+                    progress(len(stocks), 0, f"读取股票列表 {market}/{page * chunk}")
+            if market_stocks == 0:
+                raise CollectorError(f"市场 {market} 的股票列表为空，行情服务器可能异常")
 
         if not stocks:
             raise CollectorError("股票列表为空，可能是行情服务器异常")
@@ -290,9 +346,36 @@ class TdxCollector:
         report = UpdateReport()
         try:
             if refresh_list:
-                self.refresh_stock_list(progress=progress, cancelled=cancelled)
+                try:
+                    self.refresh_stock_list(progress=progress, cancelled=cancelled)
+                except CollectorError as exc:
+                    existing = self.storage.list_stocks(include_inactive=False)
+                    if not existing:
+                        raise
+                    # 列表刷新失败但本地已有股票：继续按本地列表更新，别让用户彻底卡住。
+                    message = (
+                        f"股票列表刷新失败，已改用本地 {len(existing)} 只股票继续更新：{exc}"
+                    )
+                    report.warnings.append(message)
+                    if progress:
+                        progress(0, 0, message)
             code_list = [str(c).strip() for c in codes or [] if str(c).strip()]
             stocks = self.storage.list_stocks(codes=code_list or None, include_inactive=False)
+            if code_list:
+                # 本地还没有元信息的代码也允许直接拉取，否则“指定代码更新”在首次使用时不可用。
+                known = {stock.code for stock in stocks}
+                for code in code_list:
+                    if code in known or len(code) != 6 or not code.isdigit():
+                        continue
+                    stocks.append(
+                        StockInfo(
+                            code=code,
+                            name=code,
+                            market=market_for_code(code),
+                            is_st=False,
+                            is_active=True,
+                        )
+                    )
             report.stock_count = len(stocks)
             if not stocks:
                 raise CollectorError("没有可更新的股票")
@@ -309,7 +392,10 @@ class TdxCollector:
                     report.updated += 1
                 except Exception as exc:
                     report.failed.append(f"{stock.code} {stock.name}: {exc}")
-                    self._reconnect()
+                    try:
+                        self._reconnect()
+                    except CollectorError:
+                        pass
                 if index % self.config.batch_size == 0:
                     time.sleep(self.config.batch_delay)
             if progress:

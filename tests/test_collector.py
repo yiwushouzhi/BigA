@@ -5,6 +5,7 @@ import pytest
 
 from kline_hunter.collector import TdxCollector
 from kline_hunter.config import AppConfig
+from kline_hunter.models import StockInfo
 from kline_hunter.storage import StockStorage
 
 
@@ -135,3 +136,83 @@ def test_update_all_custom_codes(collector_config, fake_api):
     assert report.updated == 1
     assert report.stock_count == 1
     assert not storage.has_daily("600000")
+
+
+def test_update_all_codes_without_refreshing_list(collector_config, fake_api):
+    """首次使用时本地没有元信息，直接指定代码也应该能拉取。"""
+    storage = StockStorage(collector_config)
+    collector = TdxCollector(collector_config, storage, api_factory=lambda: fake_api)
+    report = collector.update_all(codes=["000001"], refresh_list=False)
+    assert report.updated == 1
+    assert storage.has_daily("000001")
+    assert storage.get_stock("000001").market == 0
+
+
+def test_call_switches_host_when_api_errors(app_config, fake_api):
+    """能连上但接口报错的服务器要自动换下一台，而不是一直撞同一台。"""
+    config = AppConfig(
+        data_dir=app_config.data_dir,
+        tdx_hosts=(("bad", 7709), ("good", 7709)),
+        max_bars=25,
+        page_size=10,
+    )
+    bad = FakeApi(make_bars(25))
+
+    def boom(market):
+        raise RuntimeError("calling function error")
+
+    bad.get_security_count = boom  # type: ignore[method-assign]
+    apis = iter([bad, fake_api])
+    collector = TdxCollector(config, StockStorage(config), api_factory=lambda: next(apis))
+    assert collector.refresh_stock_list() == 5
+
+
+def test_refresh_stock_list_tolerates_single_page_failure(app_config):
+    """个别分页报错时跳过该页继续，不应让整个列表更新失败。"""
+    config = AppConfig(data_dir=app_config.data_dir, tdx_hosts=(("fake", 7709),))
+    api = PageFailApi()
+    collector = TdxCollector(config, StockStorage(config), api_factory=lambda: api)
+    count = collector.refresh_stock_list()
+    assert count == 4000
+    assert "000001" in {s.code for s in collector.storage.list_stocks()}
+
+
+def test_update_all_falls_back_to_local_list(app_config, fake_api):
+    """列表刷新失败但本地已有股票时，继续更新本地列表并给出警告。"""
+    config = AppConfig(
+        data_dir=app_config.data_dir,
+        tdx_hosts=(("fake", 7709),),
+        max_bars=25,
+        page_size=10,
+        batch_delay=0,
+    )
+    storage = StockStorage(config)
+    storage.upsert_stocks([StockInfo(code="000001", name="平安银行", market=0)])
+
+    def boom(market):
+        raise RuntimeError("calling function error")
+
+    fake_api.get_security_count = boom  # type: ignore[method-assign]
+    collector = TdxCollector(config, storage, api_factory=lambda: fake_api)
+    report = collector.update_all(refresh_list=True, incremental=False)
+    assert report.updated == 1
+    assert report.warnings
+    assert storage.has_daily("000001")
+
+
+class PageFailApi(FakeApi):
+    """模拟 3000 只股票、第二页（start=1000）解析失败的服务器。"""
+
+    def __init__(self):
+        super().__init__(make_bars(25))
+
+    def get_security_count(self, market: int) -> int:
+        return 3000
+
+    def get_security_list(self, market: int, start: int):
+        if start == 1000:
+            raise RuntimeError("calling function error")
+        page = start // 1000
+        prefixes = ("600", "601", "603") if market == 1 else ("000", "002", "300")
+        prefix = prefixes[page]
+        return [{"code": f"{prefix}{i:03d}", "name": f"股{i}"} for i in range(1000)]
